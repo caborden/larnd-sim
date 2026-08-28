@@ -9,5 +9,6 @@ docs/build
 *.pdf
 .vscode
 test
+test-results/
 *.*.swp
 _version.py

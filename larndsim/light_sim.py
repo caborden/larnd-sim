@@ -423,91 +423,115 @@ def get_triggers(signal, group_threshold, op_channel_idx, i_subbatch):
     Returns:
         tuple: array of tick indices at each trigger (shape `(ntrigs,)`) and array of op channel index (shape `(ntrigs, ndet_module)`)
     """
-    
-    shape = signal.shape
-    # sum over all signals on a single detector (shape: (ndet, nticks) -> (ngrp, ndetpergrp, nticks) -> (ngrp, 1, nticks))
-    signal_sum = signal.reshape(shape[0]//light.OP_CHANNEL_PER_TRIG, light.OP_CHANNEL_PER_TRIG, shape[-1]).sum(axis=1, keepdims=True)
-    # reduce to approximate ADC sample rate (padded with zeros)
-    sample_factor = round(light.LIGHT_DIGIT_SAMPLE_SPACING / light.LIGHT_TICK_SIZE)
-    padding = sample_factor - shape[-1] % sample_factor
-    if padding > 0:
-        signal_sum = cp.concatenate((signal_sum, cp.zeros((shape[0]//light.OP_CHANNEL_PER_TRIG, 1, padding))), axis=-1)
-    signal_sum = signal_sum.reshape(-1, 1, signal_sum.shape[-1]//sample_factor, sample_factor).mean(axis=-1, keepdims=True)
-    signal_sum = cp.broadcast_to(signal_sum, signal_sum.shape[:3] + (sample_factor,))
-    signal_sum = signal_sum.reshape(-1, 1, shape[-1] + padding)[...,:(-padding if padding > 0 else shape[-1])]
 
-    # apply trigger threshold
-    sample_above_thresh = cp.broadcast_to(signal_sum < group_threshold[:,cp.newaxis,cp.newaxis], (shape[0]//light.OP_CHANNEL_PER_TRIG, light.OP_CHANNEL_PER_TRIG, shape[-1]))
-    # cast back into the original signal array
-    sample_above_thresh = sample_above_thresh.reshape(signal.shape)
+    n_channels, n_ticks = signal.shape
 
-    # calculate the minimum number of ticks between two triggers on the same module
-    digit_ticks = ceil((light.LIGHT_TRIG_WINDOW[1] + light.LIGHT_TRIG_WINDOW[0])/light.LIGHT_TICK_SIZE)
+    def empty_result():
+        return (
+            cp.empty((0,), dtype=cp.int64),
+            cp.empty((0, n_channels), dtype=op_channel_idx.dtype),
+            cp.empty((0,), dtype=cp.int64),
+        )
 
-    tpc_ids = np.unique(light.OP_CHANNEL_TO_TPC[op_channel_idx.get()])
-    mod_ids = np.unique([detector.TPC_TO_MODULE[tpc_id] for tpc_id in tpc_ids])
+    # Beam triggers do not depend on the simulated signal. Return before doing
+    # the group reductions and threshold calculations used by threshold mode.
+    if light.LIGHT_TRIG_MODE == 1:
+        # A later subbatch belongs to an event which has already triggered.
+        if i_subbatch != 0:
+            return empty_result()
+        return (
+            cp.zeros((1,), dtype=cp.int64),
+            op_channel_idx[cp.newaxis, :],
+            cp.ones((1,), dtype=cp.int64),
+        )
+
+    channels_per_group = light.OP_CHANNEL_PER_TRIG
+    if n_channels % channels_per_group:
+        raise ValueError(
+            'The number of optical channels must be divisible by '
+            'OP_CHANNEL_PER_TRIG'
+        )
+    n_groups = n_channels // channels_per_group
+
+    # Sum the channels belonging to each trigger group.
+    signal_sum = signal.reshape(
+        n_groups, channels_per_group, n_ticks
+    ).sum(axis=1)
+
+    # Reduce to the approximate ADC sample rate. The modulo form avoids
+    # padding by a whole sample when n_ticks is already exactly divisible.
+    sample_factor = round(
+        light.LIGHT_DIGIT_SAMPLE_SPACING / light.LIGHT_TICK_SIZE
+    )
+    padding = (-n_ticks) % sample_factor
+    if padding:
+        signal_sum = cp.pad(signal_sum, ((0, 0), (0, padding)))
+
+    sampled_signal = signal_sum.reshape(
+        n_groups, -1, sample_factor
+    ).mean(axis=-1)
+
+    # Retain one threshold result per trigger group rather than broadcasting
+    # it across every optical channel. Repeat only along the time dimension to
+    # preserve the original light-tick trigger timing.
+    group_above_thresh = cp.repeat(
+        sampled_signal, sample_factor, axis=-1
+    )[:, :n_ticks]
+    group_above_thresh = (
+        group_above_thresh < group_threshold[:, cp.newaxis]
+    )
+
+    # Calculate the minimum number of ticks between two triggers on the same
+    # module.
+    digit_ticks = ceil(
+        (light.LIGHT_TRIG_WINDOW[1] + light.LIGHT_TRIG_WINDOW[0])
+        / light.LIGHT_TICK_SIZE
+    )
+
+    # Channel metadata is maintained on the host by the configuration system.
+    # Transfer the active channel list once and reuse it for every module.
+    op_channel_idx_host = cp.asnumpy(op_channel_idx)
+    grouped_channels = op_channel_idx_host.reshape(
+        n_groups, channels_per_group
+    )
+    tpc_ids = np.unique(light.OP_CHANNEL_TO_TPC[op_channel_idx_host])
+    mod_ids = np.unique(
+        [detector.TPC_TO_MODULE[tpc_id] for tpc_id in tpc_ids]
+    )
 
     trigger_idx_list = []
     op_channel_idx_list = []
-    trigger_type_list = [] # 0 --> threshold, # 1 --> beam
-    if light.LIGHT_TRIG_MODE == 0:
-        # treat each module independently
-        for mod_id, tpc_ids in [(mod_id, detector.MODULE_TO_TPCS[mod_id]) for mod_id in mod_ids]:
-            # get active channels for the module
-            op_channels = light.TPC_TO_OP_CHANNEL[tpc_ids].ravel()
-            op_channel_mask = np.isin(op_channel_idx.get(), op_channels)
-            #module_above_thresh = cp.any(sample_above_thresh[op_channels], axis=0)
-            module_above_thresh = np.any(sample_above_thresh[op_channel_mask], axis=0)        
 
-            last_trigger = 0
-            while cp.any(module_above_thresh):
-                # find next time signal goes above threshold
-                next_idx = cp.sort(cp.nonzero(module_above_thresh)[0])[0] + (last_trigger if last_trigger != 0 else 0)
-                next_trig_type = cp.asarray(0)
-                # keep track of trigger time
-                trigger_idx_list.append(next_idx)
-                trigger_type_list.append(next_trig_type)
-                op_channel_idx_list.append(op_channels)
-                # ignore samples during digitization window
-                module_above_thresh = module_above_thresh[next_idx+digit_ticks:]
-                last_trigger = next_idx + digit_ticks
+    # Treat each module independently. Candidate indices are transferred once
+    # per module, avoiding a device synchronization for every accepted trigger.
+    for mod_id in mod_ids:
+        module_tpc_ids = detector.MODULE_TO_TPCS[mod_id]
+        op_channels = light.TPC_TO_OP_CHANNEL[module_tpc_ids].ravel()
+        module_group_mask = np.any(
+            np.isin(grouped_channels, op_channels), axis=1
+        )
+        module_above_thresh = cp.any(
+            group_above_thresh[module_group_mask], axis=0
+        )
+        candidate_ticks = cp.asnumpy(cp.flatnonzero(module_above_thresh))
 
-    # if i_subbatch > 0, means this batch/event should already have a trigger
-    # then return an empty list
-    elif light.LIGHT_TRIG_MODE == 1 and i_subbatch == 0:
-        # always add a trigger for a simulated spill/event
-        # this function is called in the batch script
-        # which means it is executed per event
-        # keep track of trigger time (initial comment)
-        trigger_idx_list.append(cp.asarray(0)) # the first trigger in the event
-        op_channel_idx_list.append(op_channel_idx) 
-        trigger_type_list.append(cp.asarray(1)) # beam
+        next_allowed_tick = 0
+        for candidate_tick in candidate_ticks:
+            candidate_tick = int(candidate_tick)
+            if candidate_tick < next_allowed_tick:
+                continue
+            trigger_idx_list.append(candidate_tick)
+            op_channel_idx_list.append(op_channels)
+            next_allowed_tick = candidate_tick + digit_ticks
 
-        ## would we ever get these secondary triggers? -- Not at the moment
-        ## 1. currently the internal light simulation window is the same as the light readout window, 
-        ##    and 16us is large enough (for NuMI at least)
-        ## 2. potentially an off-beam event if ever simulated together with the beam, will be considered as a separate event
-        ##    therefore, likely will not be in the same batch
-        ##    if we ever overlay beam and off-beam, we should consider if we should compare the two signals and overlay the two light signals
-        ##    whether they would be in the same readout window; how to deal with the dead time between the two triggers etc...
-        #module_above_thresh = np.any(sample_above_thresh, axis=0)
-        #module_above_thresh = module_above_thresh[digit_ticks:]
-        #last_trigger = digit_ticks
-        #while cp.any(module_above_thresh):
-        #    # find next time signal goes above threshold
-        #    next_idx = cp.sort(cp.nonzero(module_above_thresh)[0])[0] + (last_trigger if last_trigger != 0 else 0)
-        #    next_trig_type = cp.asarray(0)
-        #    # keep track of trigger time
-        #    trigger_idx_list.append(next_idx)
-        #    trigger_type_list.append(next_trig_type)
-        #    op_channel_idx_list.append(op_channel_idx)
-        #    # ignore samples during digitization window
-        #    module_above_thresh = module_above_thresh[next_idx+digit_ticks:]
-        #    last_trigger = next_idx + digit_ticks
+    if not trigger_idx_list:
+        return empty_result()
 
-    if len(trigger_idx_list):
-        return cp.array(trigger_idx_list), cp.array(op_channel_idx_list), cp.array(trigger_type_list)
-    return cp.empty((0,), dtype=int), cp.empty((0, len(op_channel_idx)), dtype=int), cp.empty((0,), dtype=int)
+    return (
+        cp.asarray(trigger_idx_list, dtype=cp.int64),
+        cp.asarray(np.stack(op_channel_idx_list), dtype=op_channel_idx.dtype),
+        cp.zeros((len(trigger_idx_list),), dtype=cp.int64),
+    )
 
 
 @cuda.jit
