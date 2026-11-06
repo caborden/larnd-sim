@@ -1469,6 +1469,8 @@ def run_simulation(input_filename,
                     warnings.warn(f"More segments per pixel than the set MAX_TRACKS_PER_PIXEL value, {sim.MAX_TRACKS_PER_PIXEL}, "
                                     f"or no segments contributed to some pixels.")
 
+                # Pixel summation has consumed this batch's per-segment waveforms.
+                del signals
                 RangePop()
 
                 # ~~~ Far-field signal contribution ~~~
