@@ -2,7 +2,7 @@
 """
 Command-line interface to larnd-sim module.
 """
-from math import ceil, floor
+from math import ceil
 from time import time
 import warnings
 from collections import defaultdict
@@ -399,7 +399,8 @@ def run_simulation(input_filename,
                    pixel_pedestals_id=None,
                    rand_seed=None,
                    compression=None,
-                   save_memory=None):
+                   save_memory=None,
+                   pack_neighbors=True):
     """
     Command-line interface to run the simulation of a pixelated LArTPC
 
@@ -432,6 +433,7 @@ def run_simulation(input_filename,
             a command-line
         save_memory (string path, optional): if non-empty, this is used as a filename to 
             store memory snapshot information
+        pack_neighbors (bool): compact masked near-field neighbor slots. Set False for a dense control run.
         compression (str, optional): enable file compression of the output HDF5 datasets. Defaults to None,
             supported options are 'lzf' and 'gzip'
     """
@@ -1353,7 +1355,21 @@ def run_simulation(input_filename,
                 neighboring_pixels[~isin_unique_pix] = -1
                 neighboring_radius[~isin_unique_pix] = -1
 
-                n_pixels_list = isin_unique_pix.sum(axis = -1)
+                dense_width = neighboring_pixels.shape[1]
+                original_slots = None
+                if pack_neighbors:
+                    RangePush("pack_neighbors")
+                    packed_width = max(1, int(isin_unique_pix.sum(axis=1).max()))
+                    if packed_width < dense_width:
+                        shape = (selected_tracks.shape[0], packed_width)
+                        packed_pixels = cp.full(shape, -1, dtype=neighboring_pixels.dtype)
+                        packed_radius = cp.full(shape, -1, dtype=neighboring_radius.dtype)
+                        original_slots = cp.empty(shape, dtype=cp.int32)
+                        detsim.pack_neighbors[BPG, TPB](neighboring_pixels, neighboring_radius,
+                                                        packed_pixels, packed_radius, original_slots)
+                        neighboring_pixels, neighboring_radius = packed_pixels, packed_radius
+                        del packed_pixels, packed_radius
+                    RangePop()
 
                 RangePush("tracks_current", 2)
                 # Here we find the longest signal in time
@@ -1373,18 +1389,14 @@ def run_simulation(input_filename,
                 BPG_X = max(ceil(signals.shape[0] / TPB[0]),1)
                 BPG_Y = max(ceil(signals.shape[1] / TPB[1]),1)
                 BPG_Z = max(ceil(signals.shape[2] / TPB[2]),1)
-                BPG = (BPG_X, BPG_Y, BPG_Z)
-
-                # To conserve memory, we break up the signals calculation into subbatches.
-                # The subbatches are sized so that rng_states array won't have to be expanded.
-                # This is achieved by choosing a BPG_X_subbatch <= BPG_X that lets
-                # the existing length of rng_states be able to accommodate the number of threads (BPG_X_subbatch, BPG_Y, BPG_Z) x TPB.
-
-                # In the case that there are not enough rng states for even BPG_X_subbatch = 1, we will have to expand rng_states.
-                if len(rng_states) < (np.prod(TPB) * BPG[1] * BPG[2]):
-                    rng_states = maybe_create_rng_states(int(np.prod(TPB) * BPG[1] * BPG[2]), seed=rand_seed, rng_states=rng_states)
-
-                BPG_X_subbatch = min(floor(len(rng_states) / (np.prod(TPB) * BPG[1] * BPG[2])), BPG_X)
+                # RNG states are reused from track zero in each subbatch. Preserve
+                # the dense launch's padded strides, state growth and track boundaries.
+                dense_blocks_y = max(ceil(dense_width / TPB[1]), 1)
+                rng_states_per_x_block = int(np.prod(TPB)) * dense_blocks_y * BPG_Z
+                if len(rng_states) < rng_states_per_x_block:
+                    rng_states = maybe_create_rng_states(int(rng_states_per_x_block),
+                                                         seed=rand_seed, rng_states=rng_states)
+                BPG_X_subbatch = min(len(rng_states) // rng_states_per_x_block, BPG_X)
                 BPG_subbatch = (BPG_X_subbatch, BPG_Y, BPG_Z)
                 subbatches_size = BPG_X_subbatch
                 n_subbatches = ceil(BPG_X/subbatches_size)
@@ -1392,10 +1404,10 @@ def run_simulation(input_filename,
                 for i_subbatch in range(n_subbatches):
                     start = i_subbatch*subbatches_size
                     end = (i_subbatch+1)*subbatches_size
-                    detsim.tracks_current_mc[BPG_subbatch,TPB](signals[start:end],
-                                                                 neighboring_pixels[start:end],
-                                                                 selected_tracks[start:end],
-                                                                 response, rng_states)
+                    slots = None if original_slots is None else original_slots[start:end]
+                    detsim.tracks_current_mc[BPG_subbatch, TPB](
+                        signals[start:end], neighboring_pixels[start:end], selected_tracks[start:end],
+                        response, rng_states, slots, dense_blocks_y * TPB[1])
 
                 RangePop()
 

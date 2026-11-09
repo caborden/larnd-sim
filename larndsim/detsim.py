@@ -101,9 +101,23 @@ def overlapping_segment(x, y, start, end, radius):
 
     return new_start, new_end, skip
 
-# @cuda.jit
+@cuda.jit
+def pack_neighbors(pixels, radius, packed_pixels, packed_radius, original_slots):
+    """Copy valid neighbors in row order, retaining the dense slot for RNG indexing."""
+    track = cuda.grid(1)
+    if track >= pixels.shape[0]:
+        return
+    dest = 0
+    for slot in range(pixels.shape[1]):
+        if pixels[track, slot] >= 0:
+            packed_pixels[track, dest] = pixels[track, slot]
+            packed_radius[track, dest] = radius[track, slot]
+            original_slots[track, dest] = slot
+            dest += 1
+
+
 @cuda.jit(max_registers=128,  fastmath=True)
-def tracks_current_mc(signals, pixels, tracks, response, rng_states):
+def tracks_current_mc(signals, pixels, tracks, response, rng_states, original_slots=None, dense_width=0):
     """
     This CUDA kernel calculates the charge induced on the pixels by the input tracks using a
     MC method
@@ -126,6 +140,11 @@ def tracks_current_mc(signals, pixels, tracks, response, rng_states):
         t = tracks[itrk]
         pID = pixels[itrk][ipix]
         if pID < 0 : return
+        rng_slot = ipix
+        if original_slots is not None:
+            rng_slot = original_slots[itrk, ipix]
+            npix = dense_width
+        rng_index = (itrk * npix + rng_slot) * nt + it
         pID_x, pID_y, pID_plane = id2pixel(pID)
 
         if pID_x >= 0 and pID_y >= 0:
@@ -185,7 +204,7 @@ def tracks_current_mc(signals, pixels, tracks, response, rng_states):
                 y = subsegment_start[1] + step * (istep + 0.5) * direction[1]
                 z = subsegment_start[2] + step * (istep + 0.5) * direction[2]
 
-                z += xoroshiro128p_normal_float32(rng_states, itrk * npix * nt + ipix * nt + it ) * sigmas[2]
+                z += xoroshiro128p_normal_float32(rng_states, rng_index) * sigmas[2]
 
                 # find how much to shift the time for anode (collection time)
                 # detector.TPC_BORDERS[t["pixel_plane"]][2][0] is anode
@@ -193,8 +212,8 @@ def tracks_current_mc(signals, pixels, tracks, response, rng_states):
                 # equivalent to detector.DRIFT_LENGTH - abs(z - detector.TPC_BORDERS[t["pixel_plane"]][2][1])
                 shift_t_collect = abs(z - detector.TPC_BORDERS[t["pixel_plane"]][2][1]) / detector.V_DRIFT
 
-                x += xoroshiro128p_normal_float32(rng_states, itrk * npix * nt + ipix * nt + it ) * sigmas[0]
-                y += xoroshiro128p_normal_float32(rng_states, itrk * npix * nt + ipix * nt + it ) * sigmas[1]
+                x += xoroshiro128p_normal_float32(rng_states, rng_index) * sigmas[0]
+                y += xoroshiro128p_normal_float32(rng_states, rng_index) * sigmas[1]
                 x_dist = abs(x_p - x)
                 y_dist = abs(y_p - y)
 
