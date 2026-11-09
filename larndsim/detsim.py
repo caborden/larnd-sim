@@ -117,7 +117,7 @@ def pack_neighbors(pixels, radius, packed_pixels, packed_radius, original_slots)
 
 
 @cuda.jit(max_registers=128,  fastmath=True)
-def tracks_current_mc(signals, pixels, tracks, response, rng_states, original_slots=None, dense_width=0):
+def tracks_current_mc(signals, pixels, tracks, response, rng_states, original_slots, dense_width):
     """
     This CUDA kernel calculates the charge induced on the pixels by the input tracks using a
     MC method
@@ -132,6 +132,10 @@ def tracks_current_mc(signals, pixels, tracks, response, rng_states, original_sl
         response (:obj:`numpy.ndarray`): 3D array containing the tabulated response.
         rng_states (:obj:`numpy.ndarray`): array of random states for noise
             generation
+        original_slots: original neighbor indices for compacted rows. Dense launches
+            pass the pixels array here because the CUDA dispatcher expects an array.
+        dense_width: padded dense pixel stride for compacted rows. Zero selects
+            the current launch grid's pixel stride and slot index.
     """
     itrk, ipix, it = cuda.grid(3)
     ntrk, npix, nt = cuda.gridsize(3)
@@ -141,7 +145,7 @@ def tracks_current_mc(signals, pixels, tracks, response, rng_states, original_sl
         pID = pixels[itrk][ipix]
         if pID < 0 : return
         rng_slot = ipix
-        if original_slots is not None:
+        if dense_width > 0:
             rng_slot = original_slots[itrk, ipix]
             npix = dense_width
         rng_index = (itrk * npix + rng_slot) * nt + it

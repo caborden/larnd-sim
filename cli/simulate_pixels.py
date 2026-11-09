@@ -1401,13 +1401,15 @@ def run_simulation(input_filename,
                 subbatches_size = BPG_X_subbatch
                 n_subbatches = ceil(BPG_X/subbatches_size)
 
+                rng_dense_width = 0 if original_slots is None else dense_blocks_y * TPB[1]
                 for i_subbatch in range(n_subbatches):
                     start = i_subbatch*subbatches_size
                     end = (i_subbatch+1)*subbatches_size
-                    slots = None if original_slots is None else original_slots[start:end]
+                    pixels = neighboring_pixels[start:end]
+                    slots = pixels if original_slots is None else original_slots[start:end]
                     detsim.tracks_current_mc[BPG_subbatch, TPB](
-                        signals[start:end], neighboring_pixels[start:end], selected_tracks[start:end],
-                        response, rng_states, slots, dense_blocks_y * TPB[1])
+                        signals[start:end], pixels, selected_tracks[start:end],
+                        response, rng_states, slots, rng_dense_width)
 
                 RangePop()
 

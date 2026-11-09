@@ -1,4 +1,5 @@
 import numpy as np
+from numba import cuda
 from numba.cuda.random import create_xoroshiro128p_states
 
 from larndsim import detsim
@@ -35,20 +36,22 @@ def test_packed_current_preserves_waveforms_and_rng(monkeypatch):
     response = np.arange(8*8*21, dtype=np.float32).reshape(8, 8, 21)
 
     def run(neighbors, original_slots):
+        dense_width = 0 if original_slots is None else pixels.shape[1]
         states = create_xoroshiro128p_states(2 * pixels.shape[1] * 4, seed=42)
         initial = states.copy_to_host()
         signals = np.zeros((*neighbors.shape, 3), np.float32)
         for start in range(0, len(pixels), 2):
             batch = slice(start, start + 2)
-            args = () if original_slots is None else (original_slots[batch], pixels.shape[1])
+            batch_pixels = neighbors[batch]
+            batch_slots = batch_pixels if original_slots is None else original_slots[batch]
             detsim.tracks_current_mc[(2, neighbors.shape[1], 1), (1, 1, 4)](
-                signals[batch], neighbors[batch], tracks[batch], response, states, *args)
+                signals[batch], batch_pixels, tracks[batch], response, states, batch_slots, dense_width)
         final = states.copy_to_host()
         assert np.any(final != initial)
         return signals, final
 
-    dense_signals, dense_rng = run(pixels, None)
-    packed_signals, packed_rng = run(packed, slots)
+    dense_signals, dense_rng = run(cuda.to_device(pixels), None)
+    packed_signals, packed_rng = run(cuda.to_device(packed), cuda.to_device(slots))
     assert np.any(dense_signals)
     restored = np.zeros_like(dense_signals)
     restored[rows, slots[valid]] = packed_signals[rows, cols]
